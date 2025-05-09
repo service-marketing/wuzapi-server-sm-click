@@ -81,7 +81,7 @@ require (
 
 
 - Crie um arquivo chamado de systemd
-sudo nano systemd/system/wuzapi.service
+sudo nano /etc/systemd/system/wuzapi.service
 
 - Adicione:
 [Unit]
