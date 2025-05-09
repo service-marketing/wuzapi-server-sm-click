@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -45,7 +47,7 @@ func (s *server) authadmin(next http.Handler) http.Handler {
 		// Obter token do cabeçalho Authorization
 		authHeader := r.Header.Get("Authorization")
 		var token string
-		
+
 		// Formatos aceitos: "Bearer TOKEN", "TOKEN", ou via query param "token=TOKEN"
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			// Formato "Bearer TOKEN"
@@ -57,21 +59,21 @@ func (s *server) authadmin(next http.Handler) http.Handler {
 			// Tentar via query param
 			token = r.URL.Query().Get("token")
 		}
-		
+
 		// Verificar se o token é válido
 		if token == "" || token != *adminToken {
 			// Adicionar cabeçalhos CORS para permitir requisições de diferentes origens
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, token, Instance-Id")
-			
+
 			s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
 				"success": false,
-				"error": "Não autorizado. Token de administrador requerido.",
+				"error":   "Não autorizado. Token de administrador requerido.",
 			})
 			return
 		}
-		
+
 		// Adicionar informações de admin no contexto para rotas que precisam
 		adminValues := Values{map[string]string{
 			"Id":      "admin",
@@ -80,7 +82,7 @@ func (s *server) authadmin(next http.Handler) http.Handler {
 			"Webhook": "",
 			"Events":  "All",
 		}}
-		
+
 		ctx := context.WithValue(r.Context(), "userinfo", adminValues)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -97,7 +99,7 @@ func (s *server) authalice(next http.Handler) http.Handler {
 
 		// Get token from headers or uri parameters - aceita vários formatos
 		var token string
-		
+
 		// 1. Verificar Authorization header (com ou sem Bearer)
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
@@ -105,12 +107,12 @@ func (s *server) authalice(next http.Handler) http.Handler {
 		} else if authHeader != "" {
 			token = authHeader
 		}
-		
+
 		// 2. Verificar header "token" (formato legacy)
 		if token == "" {
 			token = r.Header.Get("token")
 		}
-		
+
 		// 3. Verificar query parameter "token"
 		if token == "" {
 			token = r.URL.Query().Get("token")
@@ -154,10 +156,10 @@ func (s *server) authalice(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, token")
-			
+
 			s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
 				"success": false,
-				"error": "Token inválido ou não fornecido",
+				"error":   "Token inválido ou não fornecido",
 			})
 			return
 		}
@@ -170,10 +172,10 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Get the token out of the request header
 		token := r.Header.Get("token")
-		
+
 		// Check for Instance-Id header
 		instanceId := r.Header.Get("Instance-Id")
-		
+
 		// Se não tem instanceId no header, verifica se tem na URL (para rotas /instances/{id}/...)
 		if instanceId == "" {
 			// Extrair ID da URL se for uma rota /instances/{id}/...
@@ -189,7 +191,7 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 				}
 			}
 		}
-		
+
 		if token == "" {
 			s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
 				"code":    http.StatusUnauthorized,
@@ -198,7 +200,7 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// If we don't find the token in our cache, look it up in our database
 		v, found := userinfocache.Get(token)
 		if !found {
@@ -220,7 +222,7 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 			}}
 			userinfocache.Set(token, v, cache.NoExpiration)
 		}
-		
+
 		// Se temos um instanceId específico mas não somos o admin, precisamos verificar se a instância pertence ao usuário
 		if instanceId != "" && token != *adminToken {
 			userID := v.(Values).Get("Id")
@@ -234,7 +236,7 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		
+
 		ctx := context.WithValue(r.Context(), "userinfo", v)
 		handler(w, r.WithContext(ctx))
 	}
@@ -713,7 +715,6 @@ func (s *server) GetStatus() http.HandlerFunc {
 
 // Sends a document/attachment message
 func (s *server) SendDocument() http.HandlerFunc {
-
 	type documentStruct struct {
 		Caption     string
 		Phone       string
@@ -724,43 +725,30 @@ func (s *server) SendDocument() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		userid, _ := strconv.Atoi(txtid)
 		msgid := ""
-		var resp whatsmeow.SendResponse
 
 		if clientPointer[userid] == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
 			return
 		}
 
-		decoder := json.NewDecoder(r.Body)
 		var t documentStruct
-		err := decoder.Decode(&t)
+		err := json.NewDecoder(r.Body).Decode(&t)
 		if err != nil {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode Payload"))
 			return
 		}
 
-		if t.Phone == "" {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Phone in Payload"))
-			return
-		}
-
-		if t.Document == "" {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Document in Payload"))
-			return
-		}
-
-		if t.FileName == "" {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing FileName in Payload"))
+		if t.Phone == "" || t.Document == "" || t.FileName == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Phone, Document or FileName in Payload"))
 			return
 		}
 
 		recipient, err := validateMessageFields(t.Phone, t.ContextInfo.StanzaID, t.ContextInfo.Participant)
 		if err != nil {
-			log.Error().Msg(fmt.Sprintf("%s", err))
+			log.Error().Err(err).Msg("Invalid message fields")
 			s.Respond(w, r, http.StatusBadRequest, err)
 			return
 		}
@@ -771,60 +759,80 @@ func (s *server) SendDocument() http.HandlerFunc {
 			msgid = t.Id
 		}
 
-		var uploaded whatsmeow.UploadResponse
 		var filedata []byte
 
-		if t.Document[0:29] == "data:application/octet-stream" {
-			dataURL, err := dataurl.DecodeString(t.Document)
-			if err != nil {
-				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded data from payload"))
+		// Se for uma URL, baixa e converte para base64 padrão application/octet-stream
+		if strings.HasPrefix(t.Document, "http://") || strings.HasPrefix(t.Document, "https://") {
+			log.Info().Str("url", t.Document).Msg("Downloading file from URL")
+			resp, err := http.Get(t.Document)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				log.Error().Err(err).Msg("Failed to download document from URL")
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not download file from URL"))
 				return
-			} else {
-				filedata = dataURL.Data
-				uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaDocument)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
-					return
-				}
 			}
-		} else {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Document data should start with \"data:application/octet-stream;base64,\""))
+			defer resp.Body.Close()
+
+			filedata, err = io.ReadAll(resp.Body)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to read file from response body")
+				s.Respond(w, r, http.StatusInternalServerError, errors.New("Failed to read file from URL"))
+				return
+			}
+
+			encoded := base64.StdEncoding.EncodeToString(filedata)
+			t.Document = "data:application/octet-stream;base64," + encoded
+			log.Info().Msg("File converted to base64 (application/octet-stream)")
+		}
+
+		// Processa a base64 recebida
+		if !strings.HasPrefix(t.Document, "data:application/octet-stream;base64,") {
+			log.Error().Str("document", t.Document[:30]).Msg("Invalid document format")
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Document must start with 'data:application/octet-stream;base64,'"))
 			return
 		}
 
-		msg := &waProto.Message{DocumentMessage: &waProto.DocumentMessage{
-			URL:           proto.String(uploaded.URL),
-			FileName:      &t.FileName,
-			DirectPath:    proto.String(uploaded.DirectPath),
-			MediaKey:      uploaded.MediaKey,
-			Mimetype:      proto.String(http.DetectContentType(filedata)),
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:    uploaded.FileSHA256,
-			FileLength:    proto.Uint64(uint64(len(filedata))),
-			Caption:       proto.String(t.Caption),
-		}}
-
-		if t.ContextInfo.StanzaID != nil {
-			msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-				StanzaID:      proto.String(*t.ContextInfo.StanzaID),
-				Participant:   proto.String(*t.ContextInfo.Participant),
-				QuotedMessage: &waProto.Message{Conversation: proto.String("")},
-			}
-		}
-		if t.ContextInfo.MentionedJID != nil {
-			if msg.ExtendedTextMessage.ContextInfo == nil {
-				msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{}
-			}
-			msg.ExtendedTextMessage.ContextInfo.MentionedJID = t.ContextInfo.MentionedJID
-		}
-
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		dataURL, err := dataurl.DecodeString(t.Document)
 		if err != nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
+			log.Error().Err(err).Msg("Failed to decode base64 data")
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded data"))
+			return
+		}
+		filedata = dataURL.Data
+
+		log.Info().Msg("Uploading file to WhatsApp")
+		uploaded, err := clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaDocument)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to upload file to WhatsApp")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("Failed to upload file: %v", err))
 			return
 		}
 
-		log.Info().Str("timestamp", fmt.Sprintf("%d", resp.Timestamp)).Str("id", msgid).Msg("Message sent")
+		msg := &waProto.Message{
+			DocumentMessage: &waProto.DocumentMessage{
+				URL:           proto.String(uploaded.URL),
+				FileName:      &t.FileName,
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String("application/octet-stream"),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(filedata))),
+				Caption:       proto.String(t.Caption),
+				ContextInfo:   &t.ContextInfo,
+			},
+		}
+
+		log.Info().Str("to", recipient.String()).Str("msg_id", msgid).Msg("Sending document message")
+
+		resp, err := clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to send message")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("Error sending message: %v", err))
+			return
+		}
+
+		log.Info().Str("timestamp", fmt.Sprintf("%d", resp.Timestamp)).Str("id", msgid).Msg("Document sent successfully")
+
 		response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp, "Id": msgid}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
@@ -832,7 +840,6 @@ func (s *server) SendDocument() http.HandlerFunc {
 		} else {
 			s.Respond(w, r, http.StatusOK, string(responseJson))
 		}
-		return
 	}
 }
 
@@ -893,21 +900,51 @@ func (s *server) SendAudio() http.HandlerFunc {
 		var uploaded whatsmeow.UploadResponse
 		var filedata []byte
 
-		if t.Audio[0:14] == "data:audio/ogg" {
+		if strings.HasPrefix(t.Audio, "http://") || strings.HasPrefix(t.Audio, "https://") {
+			respAudio, err := http.Get(t.Audio)
+			if err != nil || respAudio.StatusCode != http.StatusOK {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Failed to download audio from URL"))
+				return
+			}
+			defer respAudio.Body.Close()
+
+			filedata, err = io.ReadAll(respAudio.Body)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, errors.New("Failed to read downloaded audio"))
+				return
+			}
+
+			// Convert to Base64 with correct prefix
+			base64Audio := "data:audio/ogg;base64," + base64.StdEncoding.EncodeToString(filedata)
+
+			// Decode dataURL
+			dataURL, err := dataurl.DecodeString(base64Audio)
+			if err != nil {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded audio"))
+				return
+			}
+			filedata = dataURL.Data
+
+			uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaAudio)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
+				return
+			}
+		} else if strings.HasPrefix(t.Audio, "data:audio/ogg") {
 			dataURL, err := dataurl.DecodeString(t.Audio)
 			if err != nil {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded data from payload"))
 				return
-			} else {
-				filedata = dataURL.Data
-				uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaAudio)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
-					return
-				}
+			}
+			filedata = dataURL.Data
+
+			uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaAudio)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
+				return
 			}
 		} else {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Audio data should start with \"data:audio/ogg;base64,\""))
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Audio must be a valid base64 string or URL to an OGG file"))
 			return
 		}
 
@@ -963,7 +1000,7 @@ func (s *server) SendImage() http.HandlerFunc {
 
 	type imageStruct struct {
 		Phone       string
-		Image       string
+		Image       string // Pode ser base64 ou URL
 		Caption     string
 		Id          string
 		ContextInfo waProto.ContextInfo
@@ -1016,52 +1053,78 @@ func (s *server) SendImage() http.HandlerFunc {
 		var filedata []byte
 		var thumbnailBytes []byte
 
-		if t.Image[0:10] == "data:image" {
+		// Verifica se é um base64 ou URL
+		if strings.HasPrefix(t.Image, "data:image") {
+			// Processamento original para base64
 			dataURL, err := dataurl.DecodeString(t.Image)
 			if err != nil {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded data from payload"))
 				return
 			} else {
 				filedata = dataURL.Data
-				uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaImage)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
-					return
-				}
 			}
-
-			// decode jpeg into image.Image
-			reader := bytes.NewReader(filedata)
-			img, _, err := image.Decode(reader)
+		} else if strings.HasPrefix(t.Image, "http://") || strings.HasPrefix(t.Image, "https://") {
+			// Novo processamento para URL
+			// Baixa a imagem da URL
+			resp, err := http.Get(t.Image)
 			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Could not decode image for thumbnail preparation: %v", err)))
+				s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("Failed to download image from URL: %v", err)))
 				return
 			}
+			defer resp.Body.Close()
 
-			// resize to width 72 using Lanczos resampling and preserve aspect ratio
-			m := resize.Thumbnail(72, 72, img, resize.Lanczos3)
-
-			tmpFile, err := os.CreateTemp("", "resized-*.jpg")
+			// Lê os dados da imagem
+			filedata, err = io.ReadAll(resp.Body)
 			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Could not create temp file for thumbnail: %v", err)))
-				return
-			}
-			defer tmpFile.Close()
-
-			// write new image to file
-			if err := jpeg.Encode(tmpFile, m, nil); err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to encode jpeg: %v", err)))
+				s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("Failed to read image data from URL: %v", err)))
 				return
 			}
 
-			thumbnailBytes, err = os.ReadFile(tmpFile.Name())
-			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to read %s: %v", tmpFile.Name(), err)))
+			// Verifica se o conteúdo é realmente uma imagem
+			contentType := http.DetectContentType(filedata)
+			if !strings.HasPrefix(contentType, "image/") {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("URL content is not an image"))
 				return
 			}
-
 		} else {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Image data should start with \"data:image/png;base64,\""))
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Image must be a valid base64 string starting with 'data:image' or a valid URL starting with 'http://' or 'https://'"))
+			return
+		}
+
+		// Upload da imagem para o WhatsApp
+		uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaImage)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
+			return
+		}
+
+		// Criação do thumbnail
+		reader := bytes.NewReader(filedata)
+		img, _, err := image.Decode(reader)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Could not decode image for thumbnail preparation: %v", err)))
+			return
+		}
+
+		// resize to width 72 using Lanczos resampling and preserve aspect ratio
+		m := resize.Thumbnail(72, 72, img, resize.Lanczos3)
+
+		tmpFile, err := os.CreateTemp("", "resized-*.jpg")
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Could not create temp file for thumbnail: %v", err)))
+			return
+		}
+		defer tmpFile.Close()
+
+		// write new image to file
+		if err := jpeg.Encode(tmpFile, m, nil); err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to encode jpeg: %v", err)))
+			return
+		}
+
+		thumbnailBytes, err = os.ReadFile(tmpFile.Name())
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to read %s: %v", tmpFile.Name(), err)))
 			return
 		}
 
@@ -1229,7 +1292,6 @@ func (s *server) SendSticker() http.HandlerFunc {
 
 // Sends Video message
 func (s *server) SendVideo() http.HandlerFunc {
-
 	type imageStruct struct {
 		Phone         string
 		Video         string
@@ -1240,102 +1302,146 @@ func (s *server) SendVideo() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		userid, _ := strconv.Atoi(txtid)
-		msgid := ""
-		var resp whatsmeow.SendResponse
+		userid, err := strconv.Atoi(txtid)
+		if err != nil {
+			log.Error().Msg("Invalid user ID format")
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Invalid user ID"))
+			return
+		}
 
 		if clientPointer[userid] == nil {
+			log.Error().Int("userid", userid).Msg("No session found")
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
 			return
 		}
 
-		decoder := json.NewDecoder(r.Body)
 		var t imageStruct
-		err := decoder.Decode(&t)
-		if err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
+			log.Error().Msg("Failed to decode request body")
 			s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode Payload"))
 			return
 		}
 
+		log.Info().Str("phone", t.Phone).Str("video", t.Video).Msg("Payload received")
+
 		if t.Phone == "" {
+			log.Error().Msg("Missing Phone in payload")
 			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Phone in Payload"))
 			return
 		}
-
 		if t.Video == "" {
+			log.Error().Msg("Missing Video in payload")
 			s.Respond(w, r, http.StatusBadRequest, errors.New("Missing Video in Payload"))
 			return
 		}
 
 		recipient, err := validateMessageFields(t.Phone, t.ContextInfo.StanzaID, t.ContextInfo.Participant)
 		if err != nil {
-			log.Error().Msg(fmt.Sprintf("%s", err))
+			log.Error().Err(err).Msg("Validation of message fields failed")
 			s.Respond(w, r, http.StatusBadRequest, err)
 			return
 		}
 
-		if t.Id == "" {
+		msgid := t.Id
+		if msgid == "" {
 			msgid = whatsmeow.GenerateMessageID()
-		} else {
-			msgid = t.Id
 		}
 
 		var uploaded whatsmeow.UploadResponse
 		var filedata []byte
 
-		if t.Video[0:4] == "data" {
+		// Link externo (http/https)
+		if strings.HasPrefix(t.Video, "http://") || strings.HasPrefix(t.Video, "https://") {
+			log.Info().Str("video_url", t.Video).Msg("Downloading video from URL")
+
+			respVideo, err := http.Get(t.Video)
+			if err != nil || respVideo.StatusCode != http.StatusOK {
+				log.Error().Err(err).Msg("Failed to fetch video from URL")
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Failed to download video from URL"))
+				return
+			}
+			defer respVideo.Body.Close()
+
+			filedata, err = io.ReadAll(respVideo.Body)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to read video data from response body")
+				s.Respond(w, r, http.StatusInternalServerError, errors.New("Failed to read downloaded video"))
+				return
+			}
+
+			mimeType := http.DetectContentType(filedata)
+			log.Info().Str("detected_mime", mimeType).Msg("Detected MIME type of video")
+
+			if !strings.HasPrefix(mimeType, "video/") {
+				log.Error().Str("mime_type", mimeType).Msg("Downloaded file is not a video")
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Downloaded file is not a valid video"))
+				return
+			}
+
+			base64Video := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(filedata))
+			dataURL, err := dataurl.DecodeString(base64Video)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to decode base64 encoded video")
+				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded video"))
+				return
+			}
+			filedata = dataURL.Data
+
+		} else if strings.HasPrefix(t.Video, "data:video/") {
+			log.Info().Msg("Processing base64 encoded video from payload")
+
 			dataURL, err := dataurl.DecodeString(t.Video)
 			if err != nil {
+				log.Error().Err(err).Msg("Failed to decode base64 data from payload")
 				s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode base64 encoded data from payload"))
 				return
-			} else {
-				filedata = dataURL.Data
-				uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaVideo)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Failed to upload file: %v", err)))
-					return
-				}
 			}
+			filedata = dataURL.Data
 		} else {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Data should start with \"data:mime/type;base64,\""))
+			log.Error().Str("video", t.Video[:30]).Msg("Invalid video format in payload")
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Video must be a valid base64 string or URL to a video file"))
 			return
 		}
 
-		msg := &waProto.Message{VideoMessage: &waProto.VideoMessage{
-			Caption:       proto.String(t.Caption),
-			URL:           proto.String(uploaded.URL),
-			DirectPath:    proto.String(uploaded.DirectPath),
-			MediaKey:      uploaded.MediaKey,
-			Mimetype:      proto.String(http.DetectContentType(filedata)),
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:    uploaded.FileSHA256,
-			FileLength:    proto.Uint64(uint64(len(filedata))),
-			JPEGThumbnail: t.JPEGThumbnail,
-		}}
+		log.Info().Int("file_size", len(filedata)).Msg("Uploading video to WhatsApp")
 
-		if t.ContextInfo.StanzaID != nil {
-			msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-				StanzaID:      proto.String(*t.ContextInfo.StanzaID),
-				Participant:   proto.String(*t.ContextInfo.Participant),
-				QuotedMessage: &waProto.Message{Conversation: proto.String("")},
-			}
-		}
-		if t.ContextInfo.MentionedJID != nil {
-			if msg.ExtendedTextMessage.ContextInfo == nil {
-				msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{}
-			}
-			msg.ExtendedTextMessage.ContextInfo.MentionedJID = t.ContextInfo.MentionedJID
-		}
-
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		uploaded, err = clientPointer[userid].Upload(context.Background(), filedata, whatsmeow.MediaVideo)
 		if err != nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
+			log.Error().Err(err).Msg("Failed to upload video")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("Failed to upload video: %v", err))
 			return
 		}
 
-		log.Info().Str("timestamp", fmt.Sprintf("%d", resp.Timestamp)).Str("id", msgid).Msg("Message sent")
+		msg := &waProto.Message{
+			VideoMessage: &waProto.VideoMessage{
+				Caption:       proto.String(t.Caption),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(http.DetectContentType(filedata)),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(filedata))),
+				JPEGThumbnail: t.JPEGThumbnail,
+				ContextInfo:   &t.ContextInfo,
+			},
+		}
+
+		log.Info().Str("msg_id", msgid).Str("to", recipient.String()).Msg("Sending video message")
+
+		resp, err := clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to send message")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("Error sending message: %v", err))
+			return
+		}
+
+		log.Info().
+			Str("timestamp", fmt.Sprintf("%d", resp.Timestamp)).
+			Str("id", msgid).
+			Msg("Video message sent successfully")
+
 		response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp, "Id": msgid}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
@@ -1343,7 +1449,6 @@ func (s *server) SendVideo() http.HandlerFunc {
 		} else {
 			s.Respond(w, r, http.StatusOK, string(responseJson))
 		}
-		return
 	}
 }
 
@@ -3193,23 +3298,23 @@ func (s *server) ListNewsletter() http.HandlerFunc {
 // Admin List users
 func (s *server) ListUsers() http.HandlerFunc {
 	type usersStruct struct {
-		Id         int          `db:"id" json:"id"`
-		Name       string       `db:"name" json:"name"`
-		Token      string       `db:"token" json:"token"`
-		Webhook    string       `db:"webhook" json:"webhook,omitempty"`
-		Jid        string       `db:"jid" json:"jid,omitempty"`
-		Qrcode     string       `db:"qrcode" json:"qrcode,omitempty"`
-		Connected  *int         `db:"connected" json:"connected"`
-		Expiration *int         `db:"expiration" json:"expiration"`
-		ProxyUrl   *string      `db:"proxy_url" json:"proxy_url,omitempty"`
-		Events     string       `db:"events" json:"events,omitempty"`
+		Id         int     `db:"id" json:"id"`
+		Name       string  `db:"name" json:"name"`
+		Token      string  `db:"token" json:"token"`
+		Webhook    string  `db:"webhook" json:"webhook,omitempty"`
+		Jid        string  `db:"jid" json:"jid,omitempty"`
+		Qrcode     string  `db:"qrcode" json:"qrcode,omitempty"`
+		Connected  *int    `db:"connected" json:"connected"`
+		Expiration *int    `db:"expiration" json:"expiration"`
+		ProxyUrl   *string `db:"proxy_url" json:"proxy_url,omitempty"`
+		Events     string  `db:"events" json:"events,omitempty"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Verificar caminho para adaptar o formato da resposta
 		isInstancesEndpoint := strings.Contains(r.URL.Path, "/instances")
 		isAdminEndpoint := strings.Contains(r.URL.Path, "/admin/users") || strings.Contains(r.URL.Path, "/admin/users/list")
-		
+
 		// Determinar se é uma requisição de admin direto
 		isDirectAdminRequest := strings.Contains(r.URL.Path, "/admin/")
 		var token string
@@ -3238,10 +3343,10 @@ func (s *server) ListUsers() http.HandlerFunc {
 			userid = v.Get("Id")
 			token = v.Get("Token")
 		}
-		
+
 		var rows *sqlx.Rows
 		var err error
-		
+
 		// Se for admin, pode ver todas as instâncias
 		if token == *adminToken {
 			rows, err = s.db.Queryx("SELECT id,name,token,webhook,jid,qrcode,connected,expiration,proxy_url,events FROM users")
@@ -3249,7 +3354,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 			// Caso contrário, ver apenas o próprio usuário
 			rows, err = s.db.Queryx("SELECT id,name,token,webhook,jid,qrcode,connected,expiration,proxy_url,events FROM users WHERE id=$1", userid)
 		}
-		
+
 		if err != nil {
 			log.Error().Err(err).Msg("Erro ao consultar usuários")
 			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
@@ -3259,7 +3364,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 			return
 		}
 		defer rows.Close()
-		
+
 		var users []usersStruct
 		for rows.Next() {
 			var u usersStruct
@@ -3271,26 +3376,26 @@ func (s *server) ListUsers() http.HandlerFunc {
 				})
 				return
 			}
-			
+
 			// Para endpoints não-admin, não retornar o token por segurança
 			if !isAdminEndpoint {
-				u.Token = "" 
+				u.Token = ""
 			}
-			
+
 			// Garantir que valores NULL sejam tratados adequadamente
 			if u.Connected == nil {
 				zero := 0
 				u.Connected = &zero
 			}
-			
+
 			if u.Expiration == nil {
 				zero := 0
 				u.Expiration = &zero
 			}
-			
+
 			users = append(users, u)
 		}
-		
+
 		if err := rows.Err(); err != nil {
 			log.Error().Err(err).Msg("Erro durante iteração dos resultados")
 			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
@@ -3299,12 +3404,12 @@ func (s *server) ListUsers() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Adaptar formato da resposta dependendo do endpoint
 		if isInstancesEndpoint {
 			// Formato para /instances - transformar para o formato que o frontend espera
 			instances := make([]map[string]interface{}, 0)
-			
+
 			for _, u := range users {
 				// Verificar status real de conexão pelo clientPointer
 				isConnected := false
@@ -3313,26 +3418,26 @@ func (s *server) ListUsers() http.HandlerFunc {
 					isConnected = clientPointer[u.Id].IsConnected()
 					isLoggedIn = clientPointer[u.Id].IsLoggedIn()
 				}
-				
+
 				// Obter valor do campo expiration, considerando que pode ser nulo
 				var expiration int64
 				if u.Expiration != nil {
 					expiration = int64(*u.Expiration)
 				}
-				
+
 				instance := map[string]interface{}{
-					"id":        strconv.Itoa(u.Id),
-					"name":      u.Name,
-					"connected": isConnected,
-					"loggedIn":  isLoggedIn,
-					"phone":     extractPhoneFromJid(u.Jid),
-					"webhook":   u.Webhook,
-					"events":    strings.Split(u.Events, ","),
+					"id":         strconv.Itoa(u.Id),
+					"name":       u.Name,
+					"connected":  isConnected,
+					"loggedIn":   isLoggedIn,
+					"phone":      extractPhoneFromJid(u.Jid),
+					"webhook":    u.Webhook,
+					"events":     strings.Split(u.Events, ","),
 					"expiration": expiration,
 				}
 				instances = append(instances, instance)
 			}
-			
+
 			s.Respond(w, r, http.StatusOK, map[string]interface{}{
 				"success": true,
 				"data":    instances,
@@ -3352,19 +3457,19 @@ func extractPhoneFromJid(jid string) string {
 	if jid == "" {
 		return ""
 	}
-	
+
 	// Verificar se há o caractere ":" que indica recursos específicos no JID
 	colonIndex := strings.Index(jid, ":")
 	if colonIndex > 0 {
 		jid = jid[:colonIndex]
 	}
-	
+
 	// Formato típico: "5511999999999@s.whatsapp.net"
 	parts := strings.Split(jid, "@")
 	if len(parts) > 0 {
 		return parts[0]
 	}
-	
+
 	return ""
 }
 
@@ -3372,18 +3477,18 @@ func (s *server) AddUser() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var requestData struct {
 			Name         string      `json:"name"`
-			Token        string      `json:"token"` // Token é opcional para criação de instância
-			Webhook      string      `json:"webhook"` // URL do webhook
-			Events       interface{} `json:"events"` // Eventos para inscrição (aceita string ou array)
-			Expiration   int64       `json:"expiration"` // Tempo de expiração
-			ProxyUrl     string      `json:"proxy_url"` // URL do proxy
+			Token        string      `json:"token"`         // Token é opcional para criação de instância
+			Webhook      string      `json:"webhook"`       // URL do webhook
+			Events       interface{} `json:"events"`        // Eventos para inscrição (aceita string ou array)
+			Expiration   int64       `json:"expiration"`    // Tempo de expiração
+			ProxyUrl     string      `json:"proxy_url"`     // URL do proxy
 			ProxyEnabled bool        `json:"proxy_enabled"` // Se o proxy está habilitado
 		}
-		
+
 		// Verificar se este é um endpoint /instances/create ou admin/user/create
 		isInstancesCreate := strings.Contains(r.URL.Path, "/instances/create")
 		isAdminCreate := strings.Contains(r.URL.Path, "/admin/user/create") || strings.Contains(r.URL.Path, "/admin/users")
-		
+
 		if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 			log.Error().Err(err).Msg("Erro ao decodificar payload")
 			s.Respond(w, r, http.StatusBadRequest, map[string]interface{}{
@@ -3392,7 +3497,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Obter informações do usuário do contexto
 		var token string
 		if ctx := r.Context(); ctx.Value("userinfo") != nil {
@@ -3406,7 +3511,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			} else {
 				token = authHeader
 			}
-			
+
 			if token != *adminToken {
 				s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
 					"success": false,
@@ -3421,7 +3526,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Validações básicas
 		if requestData.Name == "" {
 			s.Respond(w, r, http.StatusBadRequest, map[string]interface{}{
@@ -3430,7 +3535,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Apenas o admin pode criar usuários com token específico
 		if token != *adminToken && requestData.Token != "" && !isInstancesCreate {
 			s.Respond(w, r, http.StatusForbidden, map[string]interface{}{
@@ -3439,7 +3544,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Para criação de instância, gerar token aleatório se não fornecido
 		// Tentar até 3 vezes para garantir que o token seja único
 		maxAttempts := 3
@@ -3447,7 +3552,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			for attempts := 0; attempts < maxAttempts; attempts++ {
 				// Gerar um token aleatório
 				requestData.Token = generateRandomToken(32)
-				
+
 				// Verificar se já existe token igual
 				var count int
 				err := s.db.Get(&count, "SELECT COUNT(*) FROM users WHERE token = $1", requestData.Token)
@@ -3459,12 +3564,12 @@ func (s *server) AddUser() http.HandlerFunc {
 					})
 					return
 				}
-				
+
 				// Se o token for único, podemos continuar
 				if count == 0 {
 					break
 				}
-				
+
 				// Se chegamos à última tentativa e ainda não temos um token único
 				if attempts == maxAttempts-1 {
 					s.Respond(w, r, http.StatusConflict, map[string]interface{}{
@@ -3473,7 +3578,7 @@ func (s *server) AddUser() http.HandlerFunc {
 					})
 					return
 				}
-				
+
 				// Limpar o token para a próxima tentativa
 				requestData.Token = ""
 			}
@@ -3489,7 +3594,7 @@ func (s *server) AddUser() http.HandlerFunc {
 				})
 				return
 			}
-			
+
 			if count > 0 {
 				s.Respond(w, r, http.StatusConflict, map[string]interface{}{
 					"success": false,
@@ -3498,10 +3603,10 @@ func (s *server) AddUser() http.HandlerFunc {
 				return
 			}
 		}
-		
+
 		// Preparar os campos de eventos, suporta string ou array de strings
 		eventsStr := "Message"
-		
+
 		// Verificar se Events é uma string ou um array
 		switch events := requestData.Events.(type) {
 		case string:
@@ -3524,26 +3629,26 @@ func (s *server) AddUser() http.HandlerFunc {
 				eventsStr = strings.Join(events, ",")
 			}
 		}
-		
+
 		// Definir valor do proxy URL
 		var proxyUrl sql.NullString
 		if requestData.ProxyUrl != "" && requestData.ProxyEnabled {
 			proxyUrl = sql.NullString{String: requestData.ProxyUrl, Valid: true}
 		}
-		
+
 		// Definir valor de expiração
 		expiration := 0
 		if requestData.Expiration > 0 {
 			expiration = int(requestData.Expiration)
 		}
-		
+
 		// Inserir o novo usuário sem o campo webhook_active que não existe
 		var newUserId int
 		err := s.db.QueryRow(
 			"INSERT INTO users (name, token, events, jid, qrcode, webhook, connected, expiration, proxy_url) VALUES ($1, $2, $3, '', '', $4, 0, $5, $6) RETURNING id",
 			requestData.Name, requestData.Token, eventsStr, requestData.Webhook, expiration, proxyUrl,
 		).Scan(&newUserId)
-		
+
 		if err != nil {
 			log.Error().Err(err).Msg("Erro ao inserir novo usuário")
 			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
@@ -3552,32 +3657,32 @@ func (s *server) AddUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Log do token gerado para depuração
 		log.Info().Str("token", requestData.Token).Int("userId", newUserId).Msg("Usuário criado com token")
-		
+
 		// Preparar resposta apropriada
 		responseData := map[string]interface{}{
 			"id":    strconv.Itoa(newUserId),
 			"name":  requestData.Name,
 			"token": requestData.Token,
 		}
-		
+
 		// Adicionar campos extras na resposta se fornecidos
 		if requestData.Webhook != "" {
 			responseData["webhook"] = requestData.Webhook
 			responseData["events"] = eventsStr
 		}
-		
+
 		if requestData.ProxyUrl != "" && requestData.ProxyEnabled {
 			responseData["proxy_url"] = requestData.ProxyUrl
 			responseData["proxy_enabled"] = true
 		}
-		
+
 		if expiration > 0 {
 			responseData["expiration"] = expiration
 		}
-		
+
 		if isInstancesCreate || isAdminCreate {
 			s.Respond(w, r, http.StatusCreated, map[string]interface{}{
 				"success": true,
@@ -3597,20 +3702,20 @@ func (s *server) DeleteUser() http.HandlerFunc {
 		// Get the user ID from the request URL
 		vars := mux.Vars(r)
 		userID := vars["id"]
-		
+
 		// Verificar se é uma requisição de admin
 		isDirectAdminRequest := strings.Contains(r.URL.Path, "/admin/user/")
 		if isDirectAdminRequest {
 			// Verificar o token de admin no header Authorization
 			authHeader := r.Header.Get("Authorization")
 			var token string
-			
+
 			if strings.HasPrefix(authHeader, "Bearer ") {
 				token = strings.TrimPrefix(authHeader, "Bearer ")
 			} else {
 				token = authHeader
 			}
-			
+
 			if token != *adminToken {
 				s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
 					"success": false,
@@ -3628,12 +3733,12 @@ func (s *server) DeleteUser() http.HandlerFunc {
 				})
 				return
 			}
-			
+
 			// Para requisições normais, verificar se o usuário tem permissão
 			v := ctx.Value("userinfo").(Values)
 			token := v.Get("Token")
 			requestorID := v.Get("Id")
-			
+
 			// Apenas admin ou o próprio usuário podem excluir
 			if token != *adminToken && requestorID != userID {
 				s.Respond(w, r, http.StatusForbidden, map[string]interface{}{
@@ -3643,7 +3748,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 				return
 			}
 		}
-		
+
 		// Verificar se o usuário existe
 		var exists bool
 		err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)", userID).Scan(&exists)
@@ -3655,7 +3760,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		if !exists {
 			s.Respond(w, r, http.StatusNotFound, map[string]interface{}{
 				"success": false,
@@ -3663,7 +3768,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Desconectar cliente WhatsApp se estiver conectado
 		userIDInt, _ := strconv.Atoi(userID)
 		if clientPointer[userIDInt] != nil {
@@ -3672,7 +3777,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			}
 			delete(clientPointer, userIDInt)
 		}
-		
+
 		// Delete the user from the database
 		result, err := s.db.Exec("DELETE FROM users WHERE id=$1", userID)
 		if err != nil {
@@ -3683,7 +3788,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		rowsAffected, err := result.RowsAffected()
 		if err != nil {
 			log.Error().Err(err).Msg("Erro ao obter linhas afetadas")
@@ -3693,7 +3798,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		if rowsAffected == 0 {
 			s.Respond(w, r, http.StatusNotFound, map[string]interface{}{
 				"success": false,
@@ -3701,10 +3806,10 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			})
 			return
 		}
-		
+
 		// Verificar se é uma rota de instância
 		isInstanceEndpoint := strings.Contains(r.URL.Path, "/instances/")
-		
+
 		if isInstanceEndpoint {
 			s.Respond(w, r, http.StatusOK, map[string]interface{}{
 				"success": true,
@@ -3860,8 +3965,8 @@ func (s *server) SetProxy() http.HandlerFunc {
 		}
 
 		response := map[string]interface{}{
-			"Details": "Proxy settings updated successfully",
-			"Enabled": t.Enable,
+			"Details":  "Proxy settings updated successfully",
+			"Enabled":  t.Enable,
 			"ProxyURL": t.ProxyURL,
 		}
 		responseJson, err := json.Marshal(response)
@@ -3876,16 +3981,16 @@ func (s *server) SetProxy() http.HandlerFunc {
 // generateRandomToken creates a random token string of specified length
 func generateRandomToken(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	
+
 	// Initialize the random source
 	rand.Seed(time.Now().UnixNano())
-	
+
 	// Create the token
 	b := make([]byte, length)
 	for i := range b {
 		b[i] = charset[rand.Intn(len(charset))]
 	}
-	
+
 	return string(b)
 }
 
@@ -3901,7 +4006,7 @@ type UserDetails struct {
 
 func (s *server) validateToken(token string) (UserDetails, error) {
 	var details UserDetails
-	
+
 	// Verifica se é o token de admin
 	if token == *adminToken {
 		details = UserDetails{
@@ -3912,28 +4017,28 @@ func (s *server) validateToken(token string) (UserDetails, error) {
 		}
 		return details, nil
 	}
-	
+
 	// Consulta o banco de dados
 	var txtid string
 	var webhook string
 	var jid string
 	var events string
-	
+
 	err := s.db.QueryRow("SELECT id, webhook, jid, events FROM users WHERE token=$1 LIMIT 1", token).
 		Scan(&txtid, &webhook, &jid, &events)
-	
+
 	if err != nil {
 		log.Error().Err(err).Msg("Error validating token")
 		return details, err
 	}
-	
+
 	details = UserDetails{
 		Id:      txtid,
 		Jid:     jid,
 		Webhook: webhook,
 		Events:  events,
 	}
-	
+
 	return details, nil
 }
 
@@ -4034,5 +4139,3 @@ func (s *server) DeleteUserComplete() http.HandlerFunc {
 		})
 	}
 }
-
-

@@ -53,13 +53,13 @@ func (s *server) routes() {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, token, Instance-Id")
-			
+
 			// Responder imediatamente a solicitações OPTIONS
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			
+
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -73,7 +73,7 @@ func (s *server) routes() {
 	adminRoutes.Handle("/users", s.ListUsers()).Methods("GET", "OPTIONS")
 	adminRoutes.Handle("/users", s.AddUser()).Methods("POST", "OPTIONS")
 	adminRoutes.Handle("/users/{id}", s.DeleteUser()).Methods("DELETE", "OPTIONS")
-																																																																																													adminRoutes.Handle("/users/{id}/delete-complete", s.DeleteUserComplete()).Methods("DELETE", "OPTIONS")
+	adminRoutes.Handle("/users/{id}/delete-complete", s.DeleteUserComplete()).Methods("DELETE", "OPTIONS")
 	// Rota para verificar se o usuário é admin
 	adminRoutes.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -101,24 +101,24 @@ func (s *server) routes() {
 		// Verificar token
 		authHeader := r.Header.Get("Authorization")
 		var token string
-		
+
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token = strings.TrimPrefix(authHeader, "Bearer ")
 		} else {
 			token = authHeader
 		}
-		
+
 		// Verificar se o token é válido
 		if token == "" || token != *adminToken {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success": false,
-				"error": "Não autorizado. Token de administrador requerido.",
+				"error":   "Não autorizado. Token de administrador requerido.",
 			})
 			return
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
@@ -135,7 +135,7 @@ func (s *server) routes() {
 		clientIP := r.RemoteAddr
 		password := r.URL.Query().Get("password")
 		isLocalhost := strings.HasPrefix(clientIP, "127.0.0.1") || strings.HasPrefix(clientIP, "::1") || strings.HasPrefix(clientIP, "[::1]") || strings.HasPrefix(clientIP, "localhost")
-		
+
 		if isLocalhost || password == "wuzadmin" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -206,7 +206,7 @@ func (s *server) routes() {
 	apiV1.HandleFunc("/instances/{id}/update", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		id := vars["id"]
-		
+
 		// Decodifica a requisição
 		var data struct {
 			Name string `json:"name"`
@@ -215,14 +215,14 @@ func (s *server) routes() {
 			http.Error(w, "Erro ao decodificar payload", http.StatusBadRequest)
 			return
 		}
-		
+
 		// Atualiza o nome do usuário no banco de dados
 		_, err := s.db.Exec("UPDATE users SET name = $1 WHERE id = $2", data.Name, id)
 		if err != nil {
 			http.Error(w, "Erro ao atualizar nome da instância", http.StatusInternalServerError)
 			return
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
