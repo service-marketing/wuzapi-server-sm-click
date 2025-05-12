@@ -246,6 +246,7 @@ func (s *server) routes() {
 	s.router.Handle("/session/proxy", c.Then(s.SetProxy())).Methods("POST")
 
 	s.router.Handle("/chat/send/text", c.Then(s.SendMessage())).Methods("POST")
+	s.router.Handle("/chat/revoke", c.Then(s.RevokeMessage())).Methods("POST")
 	s.router.Handle("/chat/send/image", c.Then(s.SendImage())).Methods("POST")
 	s.router.Handle("/chat/send/audio", c.Then(s.SendAudio())).Methods("POST")
 	s.router.Handle("/chat/send/document", c.Then(s.SendDocument())).Methods("POST")
@@ -281,6 +282,7 @@ func (s *server) routes() {
 
 	// Adicionar também as versões com prefixo /api/v1 para estas rotas
 	apiV1.Handle("/chat/send/text", c.Then(s.SendMessage())).Methods("POST")
+	apiV1.Handle("/chat/revoke", c.Then(s.RevokeMessage())).Methods("POST")
 	apiV1.Handle("/chat/send/image", c.Then(s.SendImage())).Methods("POST")
 	apiV1.Handle("/chat/send/audio", c.Then(s.SendAudio())).Methods("POST")
 	apiV1.Handle("/chat/send/document", c.Then(s.SendDocument())).Methods("POST")
