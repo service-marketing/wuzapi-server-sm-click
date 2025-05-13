@@ -4228,3 +4228,89 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 		})
 	}
 }
+
+// EditMessage handles the HTTP request to edit a sent message
+func (s *server) EditMessage() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Info().
+			Str("Method", r.Method).
+			Str("Path", r.URL.Path).
+			Str("RemoteAddr", r.RemoteAddr).
+			Msg("Incoming edit message request")
+
+		type EditRequest struct {
+			Chat       string `json:"chat"`
+			MessageID  string `json:"message_id"`
+			NewContent string `json:"new_content"`
+		}
+
+		var req EditRequest
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
+			log.Error().Err(err).Msg("Failed to decode request body")
+			s.Respond(w, r, http.StatusBadRequest, map[string]interface{}{
+				"error": "Invalid request body",
+			})
+			return
+		}
+
+		if req.Chat == "" || req.MessageID == "" || req.NewContent == "" {
+			log.Warn().
+				Str("Chat", req.Chat).
+				Str("MessageID", req.MessageID).
+				Str("NewContent", req.NewContent).
+				Msg("Missing required parameters")
+			s.Respond(w, r, http.StatusBadRequest, map[string]interface{}{
+				"error": "Chat, message_id and new_content are required",
+			})
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.Chat)
+		if err != nil {
+			log.Error().Err(err).Str("Chat", req.Chat).Msg("Invalid chat JID")
+			s.Respond(w, r, http.StatusBadRequest, map[string]interface{}{
+				"error": "Invalid chat JID",
+			})
+			return
+		}
+
+		userID, err := strconv.Atoi(s.getUserIDFromContext(r))
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get user ID from context")
+			s.Respond(w, r, http.StatusUnauthorized, map[string]interface{}{
+				"error": "Unauthorized: Could not determine user",
+			})
+			return
+		}
+
+		client := clientPointer[userID]
+		if client == nil {
+			log.Error().Int("UserID", userID).Msg("No client found for user")
+			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
+				"error": "No active WhatsApp client found",
+			})
+			return
+		}
+
+		// Construir a nova mensagem editada
+		newMsg := client.BuildEdit(chatJID, types.MessageID(req.MessageID), &waProto.Message{
+			Conversation: proto.String(req.NewContent),
+		})
+
+		// Enviar a edição
+		_, err = client.SendMessage(context.Background(), chatJID, newMsg)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to send edited message")
+			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
+				"error": fmt.Sprintf("Failed to send edited message: %v", err),
+			})
+			return
+		}
+
+		s.Respond(w, r, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Message edited successfully",
+		})
+	}
+}
