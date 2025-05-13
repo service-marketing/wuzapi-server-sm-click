@@ -4140,23 +4140,30 @@ func (s *server) DeleteUserComplete() http.HandlerFunc {
 	}
 }
 
+// getUserIDFromContext retrieves the user ID from the request context
+func (s *server) getUserIDFromContext(r *http.Request) string {
+	userinfo, ok := r.Context().Value("userinfo").(Values)
+	if !ok {
+		log.Error().Msg("Failed to retrieve user info from context")
+		return ""
+	}
+	return userinfo.Get("Id")
+}
+
 // RevokeMessage handles the HTTP request to revoke a sent message
 func (s *server) RevokeMessage() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Log incoming request details for debugging
 		log.Info().
 			Str("Method", r.Method).
 			Str("Path", r.URL.Path).
 			Str("RemoteAddr", r.RemoteAddr).
 			Msg("Incoming revoke message request")
 
-		// Struct to parse incoming JSON
 		type RevokeRequest struct {
 			Chat      string `json:"chat"`
 			MessageID string `json:"message_id"`
 		}
 
-		// Decode JSON request body
 		var req RevokeRequest
 		decoder := json.NewDecoder(r.Body)
 		if err := decoder.Decode(&req); err != nil {
@@ -4167,7 +4174,6 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 			return
 		}
 
-		// Validate input
 		if req.Chat == "" || req.MessageID == "" {
 			log.Warn().
 				Str("Chat", req.Chat).
@@ -4179,7 +4185,6 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 			return
 		}
 
-		// Convert chat to types.JID
 		chatJID, err := types.ParseJID(req.Chat)
 		if err != nil {
 			log.Error().Err(err).Str("Chat", req.Chat).Msg("Invalid chat JID")
@@ -4189,7 +4194,6 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 			return
 		}
 
-		// Get current user ID
 		userID, err := strconv.Atoi(s.getUserIDFromContext(r))
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to get user ID from context")
@@ -4208,22 +4212,12 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 			return
 		}
 
-		// Build revoke message
-		revokeMsg, err := s.buildRevokeMessage(client, chatJID, req.MessageID)
+		// Use the built-in revoke function
+		_, err = client.RevokeMessage(chatJID, types.MessageID(req.MessageID))
 		if err != nil {
-			log.Error().Err(err).Msg("Failed to build revoke message")
+			log.Error().Err(err).Msg("Failed to revoke message")
 			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
-				"error": fmt.Sprintf("Failed to build revoke message: %v", err),
-			})
-			return
-		}
-
-		// Send revoke message
-		_, err = client.SendMessage(context.Background(), chatJID, revokeMsg)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to send revoke message")
-			s.Respond(w, r, http.StatusInternalServerError, map[string]interface{}{
-				"error": fmt.Sprintf("Failed to send revoke message: %v", err),
+				"error": fmt.Sprintf("Failed to revoke message: %v", err),
 			})
 			return
 		}
@@ -4233,46 +4227,4 @@ func (s *server) RevokeMessage() http.HandlerFunc {
 			"message": "Message revoked successfully",
 		})
 	}
-}
-
-// buildRevokeMessage creates a message revocation request
-func (s *server) buildRevokeMessage(client *whatsmeow.Client, chat types.JID, id string) (*waProto.Message, error) {
-	// Validate input parameters
-	if chat.IsEmpty() || id == "" {
-		return nil, errors.New("chat and message ID are required")
-	}
-
-	// Validate client
-	if client == nil {
-		return nil, errors.New("no active WhatsApp client found")
-	}
-
-	// Use the client's own JID as sender
-	sender := *client.Store.ID
-
-	// Construct the revoke message
-	revocationMessage := &waProto.Message{
-		ProtocolMessage: &waProto.ProtocolMessage{
-			Type: waProto.ProtocolMessage_REVOKE.Enum(),
-			Key: &waProto.MessageKey{
-				RemoteJID:   proto.String(chat.String()),
-				FromMe:      proto.Bool(true),
-				ID:          proto.String(id),
-				Participant: proto.String(sender.String()),
-			},
-		},
-	}
-
-	return revocationMessage, nil
-}
-
-// getUserIDFromContext retrieves the user ID from the request context
-func (s *server) getUserIDFromContext(r *http.Request) string {
-	// Retrieve user info from the context
-	userinfo, ok := r.Context().Value("userinfo").(Values)
-	if !ok {
-		log.Error().Msg("Failed to retrieve user info from context")
-		return ""
-	}
-	return userinfo.Get("Id")
 }
